@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"strconv"
@@ -14,6 +13,8 @@ import (
 
 	"github.com/jamiealquiza/tachymeter"
 	"gopkg.in/Shopify/sarama.v1"
+	"encoding/binary"
+	"math"
 )
 
 type config struct {
@@ -43,6 +44,18 @@ var (
 	// Counters / misc.
 	sentCnt uint64
 	errCnt  uint64
+
+	userIds = [10]int{2781422569, 2513763972, 5574203210, 7026767647, 4873395242, 711702677, 5172055213, 9317029655, 9582205498, 3994612392}
+	chatIds = [10]int{5814783182, 8126019931, 7226307381, 1654769230, 4820333054, 1528521147, 4624369820, 4209812673, 4303066118, 9378730023}
+
+	messageTemplate = "{\"eventType\":\"MESSAGE\"," +
+		"\"userId\":%d," +
+		"\"chatId\":%d, " +
+		"\"data\":{\"chatType\":\"MemoChat\"," +
+		"\"activeMemberIds\":[%d], " +
+		"\"logId\":%d" +
+		",\"logType\":1,\"chatLog\":\"lA4C+0NnNeQgCWmSzQMuDmpJoZpvbLOYVeRHuPufII9qULc+9Up8mwP7HTWyOxwNukYpBJN2ZLVh1wV5m/1kFey0VMfjfZz/JhyQ+Guh9LupV8fIPMeujJiqBeaIXGsDSVqUdA3JfBjTDBNB3RDUd3OCoPljxqpDACHsm0YarjazLunsclgtlfKDZAjFCDxU+kFKgBSXS38AUstpf+BN99kL/WALZGh8FJ50GsB+J4Y6SUOGYF5Si5YtFOpR7NeDQMVbTYPdhQJcxwogTDWfUs1zIgMQCqZ7UczwdN2w6FM=" +
+		"\",\"sendAt\":1534837189,\"encKey\":\"iHtMGypHV2lPaCt0OIVybfZv22PTBtBv3iZ0+i33XEyuJ7yeUV9OmSJIS32WP8O6YoIA5yHc4b9m4+cACZ7y6of3iOa1UWzE6vnm+SgByKj1kwEXSUEFrsNudbiMd1hP6XYO+MECxMhgV47ndVqjOgQ9Rqs8l5bXKSRZuOAB6z0=\",\"encRevision\":0}}"
 )
 
 func init() {
@@ -229,7 +242,7 @@ func worker(n int, t *tachymeter.Tachymeter) {
 		conf.Producer.Return.Successes = true
 		conf.Producer.RequiredAcks = Config.requiredAcks
 		conf.Producer.Flush.MaxMessages = Config.batchSize
-		conf.Producer.MaxMessageBytes = Config.msgSize + 50
+		conf.Producer.MaxMessageBytes = 100000
 		conf.Version = Config.kafkaVersion
 
 		client, err := sarama.NewClient(Config.brokers, conf)
@@ -243,12 +256,12 @@ func worker(n int, t *tachymeter.Tachymeter) {
 		for i := 0; i < Config.writersPerWorker; i++ {
 			go writer(client, t)
 		}
-	// If noop, we're not creating connections at all.
-	// Just generate messages and burn CPU.
+		// If noop, we're not creating connections at all.
+		// Just generate messages and burn CPU.
 	default:
-		for i := 0; i < Config.writersPerWorker; i++ {
-			go dummyWriter(t)
-		}
+		//for i := 0; i < Config.writersPerWorker; i++ {
+		//	go dummyWriter(t)
+		//}
 	}
 
 	wait := make(chan bool)
@@ -284,87 +297,69 @@ func writer(c sarama.Client, t *tachymeter.Tachymeter) {
 		var intervalSent uint64
 
 		for {
-			// Estimate the batch size. This should shrink
-			// if we're near the rate limit. Estimated batch size =
-			// amount left to send for this interval / number of writers
-			// we have available to send this amount. If the estimate
-			// is lower than the configured batch size, send that amount
-			// instead.
-			toSend := (Config.msgRate - intervalSent) / uint64((Config.workers * Config.writersPerWorker))
-			n := int(math.Min(float64(toSend), float64(Config.batchSize)))
+		// Estimate the batch size. This should shrink
+		// if we're near the rate limit. Estimated batch size =
+		// amount left to send for this interval / number of writers
+		// we have available to send this amount. If the estimate
+		// is lower than the configured batch size, send that amount
+		// instead.
+		toSend := (Config.msgRate - intervalSent) / uint64((Config.workers * Config.writersPerWorker))
+		n := int(math.Min(float64(toSend), float64(Config.batchSize)))
 
-			for i := 0; i < n; i++ {
-				// Gen message.
-				msgData := make([]byte, Config.msgSize)
-				randMsg(msgData, *generator)
-				msg := &sarama.ProducerMessage{Topic: Config.topic, Value: sarama.ByteEncoder(msgData)}
-				// Append to batch.
-				msgBatch = append(msgBatch, msg)
-			}
-
-			sendTime = time.Now()
-			err = producer.SendMessages(msgBatch)
-			if err != nil {
-				// Sarama returns a ProducerErrors, which is a slice
-				// of errors per message errored. Use this count
-				// to establish an error rate.
-				atomic.AddUint64(&errCnt, uint64(len(err.(sarama.ProducerErrors))))
-			}
-
-			t.AddTime(time.Since(sendTime))
-			atomic.AddUint64(&sentCnt, uint64(len(msgBatch)))
-
-			msgBatch = msgBatch[:0]
-
-			intervalSent = atomic.LoadUint64(&sentCnt) - countStart
-
-			// Break if the global rate limit was met, or, if
-			// we'd exceed it assuming all writers wrote a max batch size
-			// for this interval.
-			sendEstimate := intervalSent + uint64((Config.batchSize*Config.workers*Config.writersPerWorker)-Config.writersPerWorker)
-			if sendEstimate >= Config.msgRate {
-				break
-			}
-		}
-
-		// If the global per-second rate limit was met,
-		// the inner loop breaks and the outer loop sleeps for the interval remainder.
-		time.Sleep(intervalEnd.Sub(time.Now()))
-	}
-}
-
-// dummyWriter is initialized by the worker(s) if Config.noop is True.
-// dummyWriter performs the message generation step of the normal writer,
-// but doesn't connect to / attempt to send anything to Kafka. This is used
-// purely for testing message generation performance.
-func dummyWriter(t *tachymeter.Tachymeter) {
-	source := rand.NewSource(time.Now().UnixNano())
-	generator := rand.New(source)
-	msgBatch := make([]*sarama.ProducerMessage, 0, Config.batchSize)
-
-	for {
-		for i := 0; i < Config.batchSize; i++ {
+		for i := 0; i < n; i++ {
 			// Gen message.
-			msgData := make([]byte, Config.msgSize)
-			randMsg(msgData, *generator)
-			msg := &sarama.ProducerMessage{Topic: Config.topic, Value: sarama.ByteEncoder(msgData)}
+			//msgData := make([]byte, Config.msgSize)
+			msgData, chatId := randMsg(*generator)
+			bs := make([]byte, 8)
+			binary.BigEndian.PutUint64(bs, uint64(chatId))
+			msg := &sarama.ProducerMessage{Topic: Config.topic, Key: sarama.ByteEncoder(bs), Value: sarama.ByteEncoder(msgData)}
 			// Append to batch.
 			msgBatch = append(msgBatch, msg)
 		}
 
+		sendTime = time.Now()
+		err = producer.SendMessages(msgBatch)
+		if err != nil {
+			// Sarama returns a ProducerErrors, which is a slice
+			// of errors per message errored. Use this count
+			// to establish an error rate.
+			atomic.AddUint64(&errCnt, uint64(len(err.(sarama.ProducerErrors))))
+		}
+
+		t.AddTime(time.Since(sendTime))
 		atomic.AddUint64(&sentCnt, uint64(len(msgBatch)))
-		t.AddTime(time.Duration(0))
 
 		msgBatch = msgBatch[:0]
+
+		intervalSent = atomic.LoadUint64(&sentCnt) - countStart
+
+		// Break if the global rate limit was met, or, if
+		// we'd exceed it assuming all writers wrote a max batch size
+		// for this interval.
+		sendEstimate := intervalSent + uint64((Config.batchSize*Config.workers*Config.writersPerWorker)-Config.writersPerWorker)
+		if sendEstimate >= Config.msgRate {
+			break
+		}
+
+		break
+	}
+
+	// If the global per-second rate limit was met,
+	// the inner loop breaks and the outer loop sleeps for the interval remainder.
+	time.Sleep(intervalEnd.Sub(time.Now()))
 	}
 }
 
 // randMsg returns a random message generated from the chars byte slice.
 // Message length of m bytes as defined by Config.msgSize.
-func randMsg(m []byte, generator rand.Rand) {
-	for i := range m {
-		m[i] = chars[generator.Intn(len(chars))]
-	}
+func randMsg(generator rand.Rand) (string, int64) {
+	longMaxNum := int64(999999999999999999)
+
+	userId := userIds[generator.Intn(10)]
+	chatId := int64(chatIds[generator.Intn(10)])
+	logId := generator.Int63n(longMaxNum)
+
+	return fmt.Sprintf(messageTemplate, userId, chatId, userId, logId), chatId
 }
 
 // calcOutput takes a duration t and messages sent
